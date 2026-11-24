@@ -1,21 +1,25 @@
+import argparse
 import math
 import re
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
-import mediapipe as mp
 import numpy as np
 
-from landmark_viewer import CAMERA_INDEX, create_landmarker, draw_hands
+from camera_io import video_timestamp
+from display import GREEN, RED, WHITE, YELLOW, put_centered_text, put_text
+from landmark_viewer import CAMERA_INDEX, create_landmarker, detect_hands, draw_hands
+from landmarks import HAND_SLOT_NAMES, HAND_SLOTS, SAMPLE_SHAPE, SEQUENCE_LENGTH, extract_hands
 
-# coloque seu nome aqui antes de gravar (minúsculo, sem espaço/acento, ex: "testee")
-# ele vai no nome dos arquivos pra não dar conflito entre a equipe
+# Identifica quem gravou cada amostra. Pode ser definido aqui ou com --coletor.
+# Ele entra no nome do arquivo e é usado pelo train.py como "fonte" para testar
+# o modelo com pessoas que ficaram fora do treino.
 COLLECTOR_ID = ""
 COLLECTOR_ID_PATTERN = re.compile(r"[a-z0-9]+")
 
-# lista dos sinais (sem acento pq vira nome de pasta)
 SIGNS = [
     "como", "voce", "eu", "nome", "qual", "onde", "quando", "quem", "o_que",
     "quero", "preciso", "pode", "nao_pode", "esperar", "repetir", "falar",
@@ -23,85 +27,31 @@ SIGNS = [
     "errado", "sim", "nao", "agora", "depois", "por_favor", "obrigado",
 ]
 
-SEQUENCE_LENGTH = 30
-NUM_LANDMARKS = 21
-HAND_FEATURES = NUM_LANDMARKS * 3  # x, y, z -> 63 valores por mão
-
-# 0..62 = mão direita, 63..125 = mão esquerda (se a mão não aparecer fica tudo zero)
-HAND_SLOTS = ("Right", "Left")
-HAND_SLOT_NAMES = ("D", "E")
-FRAME_FEATURES = len(HAND_SLOTS) * HAND_FEATURES
-SAMPLE_SHAPE = (SEQUENCE_LENGTH, FRAME_FEATURES)
-
-# o mediapipe acha que a imagem tá espelhada, então as mãos vêm trocadas.
-# se aparecer (E) quando levantar a mão direita, troca pra False
-SWAP_HANDEDNESS = True
-
 COUNTDOWN_SECONDS = 3
-# menos frames com mão que isso = amostra descartada
-MIN_FRAMES_WITH_HAND = 10
+MIN_FRAMES_WITH_HAND = 10  # amostras com mãos em menos frames que isso são descartadas
 MESSAGE_SECONDS = 2.5
 
 DATASET_DIR = Path(__file__).parent / "dataset"
-# cópia sem normalizar, caso a gente queira testar outra normalização depois
-SAVE_RAW = True
-RAW_DATASET_DIR = Path(__file__).parent / "dataset_raw"
 
 WINDOW_NAME = "LibrasFone - Coleta de dados (Q para sair)"
 KEY_SPACE = 32
-# setas no Windows
 KEY_LEFT = 0x250000
 KEY_RIGHT = 0x270000
-
-GREEN = (0, 255, 0)
-YELLOW = (0, 255, 255)
-RED = (0, 0, 255)
-WHITE = (255, 255, 255)
-
-
-def extract_frame_features(result) -> tuple[np.ndarray, np.ndarray, list[bool]]:
-    normalized = np.zeros((len(HAND_SLOTS), NUM_LANDMARKS, 3), dtype=np.float32)
-    raw = np.zeros_like(normalized)
-    present = [False] * len(HAND_SLOTS)
-
-    hands = []
-    for landmarks, handedness in zip(result.hand_landmarks, result.handedness):
-        category = handedness[0]
-        label = category.category_name
-        if SWAP_HANDEDNESS:
-            label = "Left" if label == "Right" else "Right"
-        hands.append((category.score, label, landmarks))
-
-    # se as duas vierem com o mesmo lado, a de maior score fica e a outra vai pro slot livre
-    for _, label, landmarks in sorted(hands, key=lambda hand: hand[0], reverse=True):
-        slot = HAND_SLOTS.index(label) if label in HAND_SLOTS else 0
-        if present[slot]:
-            slot = 1 - slot
-        if present[slot]:
-            continue
-
-        points = np.array([[lm.x, lm.y, lm.z] for lm in landmarks], dtype=np.float32)
-        raw[slot] = points
-        # normaliza pelo punho (landmark 0), assim a posição na tela não importa
-        normalized[slot] = points - points[0]
-        present[slot] = True
-
-    return normalized.reshape(-1), raw.reshape(-1), present
 
 
 def collector_id_problem() -> str | None:
     if not COLLECTOR_ID:
         return "COLLECTOR_ID vazio"
     if not COLLECTOR_ID_PATTERN.fullmatch(COLLECTOR_ID):
-        return f"COLLECTOR_ID invalido: {COLLECTOR_ID!r}"
+        return f"COLLECTOR_ID inválido: {COLLECTOR_ID!r}"
     return None
 
 
 def report_collector_id_problem(problem: str) -> None:
     print(
         f"\nAVISO: {problem}.\n"
-        'Abra collect_data.py e defina COLLECTOR_ID no topo com o seu nome, ex.: COLLECTOR_ID = "etse"\n'
-        "(só letras minúsculas e números, sem espaços nem acentos).\n"
+        'Rode com --coletor seunome ou defina COLLECTOR_ID no topo de collect_data.py, ex.: COLLECTOR_ID = "etse"\n'
+        "(apenas letras minúsculas e números, sem espaços nem acentos).\n"
         "A gravação fica BLOQUEADA até isso ser feito.\n",
         file=sys.stderr,
     )
@@ -116,17 +66,16 @@ def own_sample_files(sign: str) -> list[Path]:
 
 
 def find_incompatible_samples() -> list[tuple[Path, str]]:
-    # procura amostras do formato antigo
     incompatible = []
-    for root in (DATASET_DIR, RAW_DATASET_DIR):
-        for path in sorted(root.rglob("*.npy")):
-            try:
-                shape = np.load(path, mmap_mode="r").shape
-            except Exception:
-                incompatible.append((path, "ilegível"))
-                continue
-            if shape != SAMPLE_SHAPE:
-                incompatible.append((path, f"shape {shape}"))
+    for path in sorted(DATASET_DIR.rglob("*.npy")):
+        try:
+            # mmap_mode="r" lê só o cabeçalho, sem carregar o arquivo inteiro.
+            shape = np.load(path, mmap_mode="r").shape
+        except Exception:
+            incompatible.append((path, "ilegível"))
+            continue
+        if shape != SAMPLE_SHAPE:
+            incompatible.append((path, f"formato {shape}"))
     return incompatible
 
 
@@ -143,49 +92,76 @@ def report_incompatible_samples(incompatible: list[tuple[Path, str]]) -> None:
         print(f"  ... e mais {len(incompatible) - 10}", file=sys.stderr)
     print(
         "A gravação fica BLOQUEADA até você mover ou apagar essas amostras, por exemplo\n"
-        "renomeando dataset/ e dataset_raw/ para dataset_antigo/ e dataset_raw_antigo/.\n",
+        "renomeando dataset/ para dataset_antigo/.\n",
         file=sys.stderr,
     )
 
 
 def next_sample_index(sign: str) -> int:
-    # pega o maior número + 1, pra nunca repetir nome
     pattern = re.compile(rf"{re.escape(sign)}_{re.escape(COLLECTOR_ID)}_(\d+)\.npy")
     used = [0]
-    for folder in (DATASET_DIR / sign, RAW_DATASET_DIR / sign):
-        for path in folder.glob(f"{sign}_{COLLECTOR_ID}_*.npy"):
-            match = pattern.fullmatch(path.name)
-            if match:
-                used.append(int(match.group(1)))
+    for path in (DATASET_DIR / sign).glob(f"{sign}_{COLLECTOR_ID}_*.npy"):
+        match = pattern.fullmatch(path.name)
+        if match:
+            used.append(int(match.group(1)))
     return max(used) + 1
 
 
-def save_sample(sign: str, normalized: np.ndarray, raw: np.ndarray) -> Path:
-    name = f"{sign}_{COLLECTOR_ID}_{next_sample_index(sign):04d}.npy"
-    targets = [(DATASET_DIR / sign / name, normalized)]
-    if SAVE_RAW:
-        targets.append((RAW_DATASET_DIR / sign / name, raw))
-    for path, data in targets:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # "x" dá erro se o arquivo já existir, pra não sobrescrever
-        with open(path, "xb") as f:
-            np.save(f, data)
-    return targets[0][0]
+def save_sample(sign: str, sample: np.ndarray) -> Path:
+    problem = collector_id_problem()
+    if problem:
+        raise ValueError(problem)
+    path = DATASET_DIR / sign / f"{sign}_{COLLECTOR_ID}_{next_sample_index(sign):04d}.npy"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # O modo "xb" falha se o arquivo já existir, então nunca sobrescreve uma amostra.
+    with open(path, "xb") as f:
+        np.save(f, np.asarray(sample, dtype=np.float32))
+    return path
 
 
-def put_text(frame, text, origin, scale=0.7, color=WHITE, thickness=2) -> None:
-    cv2.putText(frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness + 3, cv2.LINE_AA)
-    cv2.putText(frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+@dataclass
+class RecordingSession:
+
+    state: str = "idle"
+    countdown_end: float = 0.0
+    frames: list = field(default_factory=list)
+    frames_with_hand: int = 0
+
+    def start(self, now: float) -> None:
+        self.state = "countdown"
+        self.countdown_end = now + COUNTDOWN_SECONDS
+
+    def update(self, hands: np.ndarray, has_hand: bool, now: float) -> np.ndarray | None:
+        if self.state == "countdown" and now >= self.countdown_end:
+            self.state = "recording"
+            self.frames, self.frames_with_hand = [], 0
+        if self.state != "recording":
+            return None
+        self.frames.append(hands.reshape(-1).copy())
+        self.frames_with_hand += bool(has_hand)
+        if len(self.frames) == SEQUENCE_LENGTH:
+            self.state = "idle"
+            return np.stack(self.frames)
+        return None
 
 
-def put_centered_text(frame, text, y, scale, color, thickness) -> None:
-    (width, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
-    put_text(frame, text, ((frame.shape[1] - width) // 2, y), scale, color, thickness)
-
-
-def main() -> int:
-    cap = cv2.VideoCapture(CAMERA_INDEX)
+def main(argv=None) -> int:
+    global COLLECTOR_ID
+    parser = argparse.ArgumentParser(description="Coleta de amostras do LibrasFone pela webcam.")
+    parser.add_argument("--coletor", help="nome do coletor; alternativa a editar COLLECTOR_ID")
+    parser.add_argument("--camera", type=int, default=CAMERA_INDEX)
+    args = parser.parse_args(argv)
+    if args.coletor is not None:
+        if not COLLECTOR_ID_PATTERN.fullmatch(args.coletor):
+            parser.error("--coletor deve conter apenas letras minúsculas e números")
+        COLLECTOR_ID = args.coletor
+    if args.camera < 0:
+        parser.error("--camera deve ser um índice não negativo")
+    # Aqui a câmera é lida diretamente, sem o CameraReader: a amostra precisa
+    # de SEQUENCE_LENGTH frames consecutivos, sem pular nenhum.
+    cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
+        cap.release()
         print("Erro: não foi possível abrir a webcam.", file=sys.stderr)
         return 1
 
@@ -201,11 +177,7 @@ def main() -> int:
     total_counts = {sign: len(sample_files(sign)) for sign in SIGNS}
     sign_index = 0
 
-    state = "idle"  # idle -> countdown -> recording
-    countdown_end = 0.0
-    normalized_frames: list[np.ndarray] = []
-    raw_frames: list[np.ndarray] = []
-    frames_with_hand = 0
+    recording = RecordingSession()
 
     message, message_color, message_until = "", GREEN, 0.0
 
@@ -217,46 +189,35 @@ def main() -> int:
             while True:
                 ok, frame = cap.read()
                 if not ok:
-                    print("Erro: falha ao ler frame da webcam.", file=sys.stderr)
+                    print("Erro: falha ao ler um frame da webcam.", file=sys.stderr)
                     return 1
 
                 now = time.monotonic()
-                # o modo VIDEO precisa de timestamp sempre crescente
-                timestamp_ms = max(int((now - start) * 1000), last_timestamp_ms + 1)
+                timestamp_ms = video_timestamp(now - start, last_timestamp_ms)
                 last_timestamp_ms = timestamp_ms
 
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                result = landmarker.detect_for_video(mp_image, timestamp_ms)
-                normalized, raw, hands_present = extract_frame_features(result)
+                result = detect_hands(landmarker, frame, timestamp_ms)
+                hands, hands_present = extract_hands(result, frame.shape[1] / frame.shape[0])
                 has_hand = any(hands_present)
 
                 sign = SIGNS[sign_index]
 
-                if state == "countdown" and now >= countdown_end:
-                    state = "recording"
-                    normalized_frames, raw_frames, frames_with_hand = [], [], 0
+                sample = recording.update(hands, has_hand, now)
+                if sample is not None:
+                    message_until = now + MESSAGE_SECONDS
+                    if recording.frames_with_hand < MIN_FRAMES_WITH_HAND:
+                        message = f"DESCARTADA: mãos em só {recording.frames_with_hand}/{SEQUENCE_LENGTH} frames"
+                        message_color = RED
+                    else:
+                        path = save_sample(sign, sample)
+                        counts[sign] += 1
+                        total_counts[sign] += 1
+                        message = f"Salva: {path.name} (mãos em {recording.frames_with_hand}/{SEQUENCE_LENGTH} frames)"
+                        message_color = GREEN
+                        print(f"Amostra salva em {path}")
 
-                if state == "recording":
-                    normalized_frames.append(normalized)
-                    raw_frames.append(raw)
-                    frames_with_hand += has_hand
-                    if len(normalized_frames) == SEQUENCE_LENGTH:
-                        state = "idle"
-                        message_until = now + MESSAGE_SECONDS
-                        if frames_with_hand < MIN_FRAMES_WITH_HAND:
-                            message = f"DESCARTADA: maos em so {frames_with_hand}/{SEQUENCE_LENGTH} frames"
-                            message_color = RED
-                        else:
-                            path = save_sample(sign, np.stack(normalized_frames), np.stack(raw_frames))
-                            counts[sign] += 1
-                            total_counts[sign] += 1
-                            message = f"Salva: {path.name} (maos em {frames_with_hand}/{SEQUENCE_LENGTH} frames)"
-                            message_color = GREEN
-                            print(f"Amostra salva em {path}")
-
+                # ---- desenho da tela
                 draw_hands(frame, result)
-                # espelha só pra mostrar na tela
                 frame = cv2.flip(frame, 1)
                 height, width = frame.shape[:2]
 
@@ -270,55 +231,54 @@ def main() -> int:
                     sides = "+".join(name for name, here in zip(HAND_SLOT_NAMES, hands_present) if here)
                     put_text(frame, f"Mãos detectadas: {sum(hands_present)} ({sides})", (10, 92), 0.6, GREEN)
                 else:
-                    put_text(frame, "Maos detectadas: 0", (10, 92), 0.6, RED)
+                    put_text(frame, "Mãos detectadas: 0", (10, 92), 0.6, RED)
 
                 if incompatible:
-                    put_text(frame, f"FORMATO ANTIGO: {len(incompatible)} amostra(s) incompativeis", (10, 126), 0.6, RED)
-                    put_text(frame, "Gravacao bloqueada: mova ou apague dataset/ e dataset_raw/", (10, 150), 0.5, RED)
-                    put_text(frame, "(lista no console) e abra o script de novo", (10, 172), 0.5, RED)
+                    put_text(frame, f"FORMATO ANTIGO: {len(incompatible)} amostra(s) incompatíveis", (10, 126), 0.6, RED)
+                    put_text(frame, "Gravação bloqueada: mova ou apague as amostras antigas de dataset/", (10, 150), 0.5, RED)
+                    put_text(frame, "(lista no terminal) e abra o programa novamente", (10, 172), 0.5, RED)
                 elif collector_problem:
-                    put_text(frame, f"{collector_problem}: gravacao bloqueada", (10, 126), 0.6, RED)
-                    put_text(frame, 'Defina COLLECTOR_ID = "seunome" no topo de collect_data.py', (10, 150), 0.5, RED)
-                    put_text(frame, "(minusculas, sem espacos nem acentos) e abra o script de novo", (10, 172), 0.5, RED)
+                    put_text(frame, f"{collector_problem}: gravação bloqueada", (10, 126), 0.6, RED)
+                    put_text(frame, "Rode com --coletor seunome (ou defina COLLECTOR_ID)", (10, 150), 0.5, RED)
+                    put_text(frame, "(minúsculas, sem espaços nem acentos) e abra o programa novamente", (10, 172), 0.5, RED)
 
-                if state == "countdown":
-                    remaining = max(1, math.ceil(countdown_end - now))
+                if recording.state == "countdown":
+                    remaining = max(1, math.ceil(recording.countdown_end - now))
                     put_centered_text(frame, str(remaining), height // 2 + 40, 5.0, YELLOW, 10)
                     put_centered_text(frame, "Prepare o sinal...", height // 2 + 90, 0.8, YELLOW, 2)
-                elif state == "recording":
+                elif recording.state == "recording":
                     cv2.rectangle(frame, (0, 0), (width - 1, height - 1), RED, 8)
                     put_centered_text(
-                        frame, f"GRAVANDO {len(normalized_frames)}/{SEQUENCE_LENGTH}", height - 50, 0.9, RED, 2
+                        frame, f"GRAVANDO {len(recording.frames)}/{SEQUENCE_LENGTH}", height - 50, 0.9, RED, 2
                     )
-                    progress = int((width - 40) * len(normalized_frames) / SEQUENCE_LENGTH)
+                    progress = int((width - 40) * len(recording.frames) / SEQUENCE_LENGTH)
                     cv2.rectangle(frame, (20, height - 35), (width - 20, height - 20), WHITE, 1)
                     cv2.rectangle(frame, (20, height - 35), (20 + progress, height - 20), RED, -1)
                 else:
                     if now < message_until:
                         put_text(frame, message, (10, height - 45), 0.6, message_color)
-                    put_text(frame, "ESPACO: gravar   N/P ou setas: trocar sinal   Q: sair", (10, height - 15), 0.5)
+                    put_text(frame, "ESPAÇO: gravar   N/P ou setas: trocar sinal   Q: sair", (10, height - 15), 0.5)
 
                 cv2.imshow(WINDOW_NAME, frame)
 
+                # ---- teclado (waitKeyEx devolve códigos maiores para as setas)
                 key = cv2.waitKeyEx(1)
                 char = chr(key & 0xFF).lower() if 0 <= key < 256 else ""
                 if char == "q":
                     break
-                # só deixa trocar de sinal/gravar quando não tá gravando
-                if state == "idle":
+                if recording.state == "idle":
                     if char == "n" or key == KEY_RIGHT:
                         sign_index = (sign_index + 1) % len(SIGNS)
                     elif char == "p" or key == KEY_LEFT:
                         sign_index = (sign_index - 1) % len(SIGNS)
                     elif key == KEY_SPACE and incompatible:
-                        message = "Bloqueado: ha amostras em formato antigo (veja o console)"
+                        message = "Bloqueado: há amostras em formato antigo (veja o terminal)"
                         message_color, message_until = RED, now + MESSAGE_SECONDS
                     elif key == KEY_SPACE and collector_problem:
-                        message = "Bloqueado: defina COLLECTOR_ID no topo de collect_data.py"
+                        message = "Bloqueado: rode com --coletor seunome"
                         message_color, message_until = RED, now + MESSAGE_SECONDS
                     elif key == KEY_SPACE:
-                        state = "countdown"
-                        countdown_end = now + COUNTDOWN_SECONDS
+                        recording.start(now)
     finally:
         cap.release()
         cv2.destroyAllWindows()
