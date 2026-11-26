@@ -42,9 +42,28 @@ Opções úteis do `librasfone.py`:
 | `--registrar` | grava a sessão (latência, CPU) em `testes/` |
 | `--roteiro` | pede cada palavra e anota o que foi reconhecido (liga `--registrar`) |
 
-## Coleta de dados
+## Origem dos dados
 
-A gente montou o próprio dataset gravando os sinais. Detalhe importante: **não salva vídeo** — ele guarda só as coordenadas dos pontos da mão em cada frame. Cada amostra é uma sequência de 30 frames (mais ou menos 1-2 segundos de movimento).
+A base usada nos resultados do TCC **não foi gravada pela equipe**: as amostras foram
+extraídas de **vídeos públicos de terceiros** com o `extract_videos.py` — 194 vídeos
+geraram 244 amostras reais, cobrindo 33 palavras e oito grupos de sinalizadores. O
+`dataset/_videos.json` guarda a origem de cada amostra e o `dataset/_sinalizadores.json`
+liga cada vídeo à pessoa que sinaliza nele (é esse mapa que permite o teste de
+generalização por sinalizador).
+
+Em qualquer um dos dois caminhos, **o vídeo não é armazenado** — só as coordenadas dos
+pontos da mão em cada frame. Cada amostra é uma sequência de 30 frames (mais ou menos
+1-2 segundos de movimento).
+
+```
+python extract_videos.py
+```
+
+## Coleta de dados (gravação própria)
+
+O `collect_data.py` é a ferramenta para gravar amostras novas com a webcam. Ela existe
+para ampliar a base — principalmente para aumentar o número de **sinalizadores
+diferentes por sinal**, que é a maior limitação de generalização identificada.
 
 ```
 python collect_data.py
